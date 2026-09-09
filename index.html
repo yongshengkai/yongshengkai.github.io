@@ -2,10 +2,650 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>我是书记，请叫我书记</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>玻璃珠掉落 · Glass Marbles</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden;background:#080b14}
+body{
+  font:13px/1.5 ui-sans-serif,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  color:#e8eefc;-webkit-user-select:none;user-select:none;touch-action:none;cursor:crosshair;
+}
+canvas{display:block;width:100%;height:100%}
+.ui{
+  position:fixed;left:18px;top:18px;z-index:10;
+  width:min(272px,calc(100vw - 36px));
+  background:rgba(16,22,38,.55);
+  -webkit-backdrop-filter:blur(14px) saturate(150%);
+  backdrop-filter:blur(14px) saturate(150%);
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:16px;padding:14px 16px 16px;
+  box-shadow:0 18px 50px rgba(0,0,0,.45);
+}
+h1{font-size:12px;font-weight:600;letter-spacing:.22em;text-transform:uppercase;opacity:.9}
+.sub{font-size:11px;opacity:.45;margin-top:3px;letter-spacing:.04em}
+.row{display:flex;gap:7px;flex-wrap:wrap;margin-top:13px}
+button{
+  font:inherit;font-size:12px;color:#e8eefc;background:rgba(255,255,255,.07);
+  border:1px solid rgba(255,255,255,.14);border-radius:10px;padding:7px 11px;
+  cursor:pointer;transition:background .15s,border-color .15s,transform .08s;
+}
+button:hover{background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.3)}
+button:active{transform:translateY(1px)}
+button[aria-pressed="true"]{background:rgba(122,178,255,.24);border-color:rgba(150,200,255,.55)}
+label{display:flex;align-items:center;gap:9px;font-size:11px;opacity:.72;margin-top:11px}
+label span{width:30px;flex:none}
+label b{width:40px;flex:none;text-align:right;font-weight:500;font-variant-numeric:tabular-nums;opacity:.85}
+input[type=range]{flex:1;height:3px;-webkit-appearance:none;appearance:none;background:rgba(255,255,255,.16);border-radius:3px;outline:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:#9cc4ff;border:none;cursor:pointer;box-shadow:0 0 10px rgba(140,190,255,.6)}
+input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;background:#9cc4ff;border:none;cursor:pointer}
+.tip{font-size:11px;line-height:1.75;opacity:.42;margin-top:13px;border-top:1px solid rgba(255,255,255,.08);padding-top:10px}
+.fps{position:fixed;right:18px;top:18px;z-index:10;font-size:11px;opacity:.35;font-variant-numeric:tabular-nums}
+</style>
 </head>
 <body>
-<h1>恭喜！网站部署成功啦！</h1>
-<p>我是书记，请叫我书记～</p>
+<canvas id="c"></canvas>
+
+<div class="ui">
+  <h1>Glass Marbles</h1>
+  <div class="sub">玻璃珠掉落与反弹模拟</div>
+  <div class="row">
+    <button id="drop">撒一把</button>
+    <button id="rain" aria-pressed="false">持续掉落</button>
+    <button id="shake">摇一摇</button>
+    <button id="clear">清空</button>
+  </div>
+  <label><span>弹性</span><input id="rest" type="range" min="0" max="98" value="76"><b id="restV">0.76</b></label>
+  <label><span>重力</span><input id="grav" type="range" min="10" max="260" value="115"><b id="gravV">1.15</b></label>
+  <label><span>大小</span><input id="size" type="range" min="8" max="42" value="20"><b id="sizeV">20</b></label>
+  <div class="tip">
+    点击 / 拖动 → 投出玻璃珠<br>
+    右键拖动 → 搅动珠子<br>
+    空格 → 撒一把　R → 重置
+  </div>
+</div>
+<div class="fps" id="fps"></div>
+
+<script>
+"use strict";
+const cvs = document.getElementById('c'), ctx = cvs.getContext('2d', { alpha: false });
+
+/* ---------- viewport ---------- */
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  const prevDpr = DPR;
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  // sprites are baked at the old pixel density; drop them when it changes
+  if (DPR !== prevDpr) {
+    spriteCache.clear(); softCache.clear();
+    for (const m of marbles) m.spr = sprite(m.hue, m.r);
+  }
+  W = cvs.clientWidth; H = cvs.clientHeight;
+  cvs.width = Math.round(W * DPR); cvs.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  buildBackdrop();
+}
+window.addEventListener('resize', resize);
+
+/* ---------- tunables ---------- */
+const cfg = {
+  restitution: 0.76,   // bounce energy kept
+  gravity: 1.15,       // px / frame^2 @60fps
+  radius: 20,          // base marble radius
+  friction: 0.992,     // air drag
+  ground: 0.90,        // tangential damping on floor contact
+  maxCount: 190,
+  floorH: 74           // floor plate height
+};
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const floorY = () => H - cfg.floorH;
+
+/* ---------- glass sprites (pre-rendered, cached by hue+radius) ---------- */
+const PAD = 1.32;                       // sprite margin for glow
+const spriteCache = new Map();
+function makeCanvas(size) {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = Math.ceil(size);
+  return cv;
+}
+
+/* Sprites are rasterised at device resolution and drawn back at CSS size, so
+   they stay sharp on HiDPI screens instead of being upscaled by the DPR
+   transform on the main context. */
+function makeSpriteCanvas(cssSize) {
+  const cv = makeCanvas(Math.ceil(cssSize * DPR));
+  const g = cv.getContext('2d');
+  g.scale(DPR, DPR);
+  return { cv, g };
+}
+
+/* the part that spins with the marble: refracted core + colour ribbon */
+function buildBody(hue, r) {
+  const s = r * 2 * PAD, c = s / 2, { cv, g } = makeSpriteCanvas(s);
+  g.translate(c, c);
+
+  // transmitted light: brightest opposite the light source (light = upper-left)
+  let grd = g.createRadialGradient(r * .30, r * .34, r * .05, 0, 0, r);
+  grd.addColorStop(0, `hsla(${hue},92%,80%,.92)`);
+  grd.addColorStop(.42, `hsla(${hue},85%,58%,.62)`);
+  grd.addColorStop(.80, `hsla(${hue + 14},70%,34%,.44)`);
+  grd.addColorStop(1, `hsla(${hue + 24},60%,20%,.30)`);
+  g.fillStyle = grd;
+  g.beginPath(); g.arc(0, 0, r, 0, 6.2832); g.fill();
+
+  // twisted ribbon inclusion, clipped to the sphere
+  g.save();
+  g.beginPath(); g.arc(0, 0, r * .96, 0, 6.2832); g.clip();
+  g.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < 3; i++) {
+    const a = i * 2.094, w = r * (.30 - i * .05);
+    const rg = g.createLinearGradient(-r, -r * .3, r, r * .3);
+    rg.addColorStop(0, `hsla(${hue + i * 26 - 20},100%,72%,0)`);
+    rg.addColorStop(.5, `hsla(${hue + i * 26 - 20},100%,${72 - i * 6}%,${.5 - i * .12})`);
+    rg.addColorStop(1, `hsla(${hue + i * 26 + 30},100%,70%,0)`);
+    g.save(); g.rotate(a); g.scale(1, .34 + i * .12);
+    g.fillStyle = rg;
+    g.beginPath(); g.ellipse(0, 0, r * .95, w, 0, 0, 6.2832); g.fill();
+    g.restore();
+  }
+  g.restore();
+  return cv;
+}
+/* fixed-in-world shell: shading, rim light, specular highlights */
+function buildShell(hue, r) {
+  const s = r * 2 * PAD, c = s / 2, { cv, g } = makeSpriteCanvas(s);
+  g.translate(c, c);
+
+  // darken the lower-right limb so the sphere reads as round
+  let sh = g.createRadialGradient(-r * .34, -r * .38, r * .12, 0, 0, r * 1.02);
+  sh.addColorStop(0, 'rgba(0,0,0,0)');
+  sh.addColorStop(.55, 'rgba(0,0,0,0)');
+  sh.addColorStop(.88, 'rgba(4,8,20,.34)');
+  sh.addColorStop(1, 'rgba(2,5,14,.60)');
+  g.fillStyle = sh;
+  g.beginPath(); g.arc(0, 0, r, 0, 6.2832); g.fill();
+
+  g.globalCompositeOperation = 'lighter';
+
+  // fresnel rim: thin bright edge, strongest at the shadow side
+  let rim = g.createRadialGradient(0, 0, r * .74, 0, 0, r);
+  rim.addColorStop(0, 'rgba(255,255,255,0)');
+  rim.addColorStop(.80, `hsla(${hue},60%,80%,.10)`);
+  rim.addColorStop(.965, 'rgba(228,242,255,.62)');
+  rim.addColorStop(1, 'rgba(255,255,255,.16)');
+  g.fillStyle = rim;
+  g.beginPath(); g.arc(0, 0, r, 0, 6.2832); g.fill();
+
+  // bounced light from the floor, low on the sphere
+  let bl = g.createRadialGradient(r * .10, r * .62, 0, r * .10, r * .62, r * .55);
+  bl.addColorStop(0, `hsla(${hue + 30},90%,72%,.34)`);
+  bl.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = bl;
+  g.beginPath(); g.arc(0, 0, r * .99, 0, 6.2832); g.fill();
+
+  // primary specular: soft blob + tight hot core
+  let hl = g.createRadialGradient(-r * .36, -r * .42, 0, -r * .36, -r * .42, r * .52);
+  hl.addColorStop(0, 'rgba(255,255,255,.95)');
+  hl.addColorStop(.30, 'rgba(255,255,255,.42)');
+  hl.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = hl;
+  g.beginPath(); g.arc(0, 0, r, 0, 6.2832); g.fill();
+
+  g.fillStyle = 'rgba(255,255,255,.98)';
+  g.beginPath(); g.ellipse(-r * .38, -r * .46, r * .17, r * .12, -.6, 0, 6.2832); g.fill();
+
+  // secondary glint on the opposite limb
+  g.fillStyle = 'rgba(200,228,255,.5)';
+  g.beginPath(); g.ellipse(r * .40, r * .40, r * .13, r * .07, -.7, 0, 6.2832); g.fill();
+  return cv;
+}
+
+function sprite(hue, r) {
+  const key = ((hue / 6) | 0) + '_' + ((r * 2) | 0);
+  let s = spriteCache.get(key);
+  if (!s) {
+    // css is the on-screen draw size; the bitmaps themselves are DPR times larger
+    s = { body: buildBody(hue, r), shell: buildShell(hue, r), css: r * 2 * PAD };
+    spriteCache.set(key, s);
+  }
+  return s;
+}
+
+/* Soft radial sprites for shadow / caustic / bloom. These are blurry, so one
+   cached copy can be stretched and alpha-modulated per marble instead of
+   rebuilding a gradient every frame. */
+const SOFT = 96;
+const softCache = new Map();
+function softSprite(key, stops) {
+  let cv = softCache.get(key);
+  if (cv) return cv;
+  const built = makeSpriteCanvas(SOFT);
+  cv = built.cv;
+  const g = built.g, c = SOFT / 2;
+  const grd = g.createRadialGradient(c, c, 0, c, c, c);
+  for (const [at, col] of stops) grd.addColorStop(at, col);
+  g.fillStyle = grd;
+  g.beginPath(); g.arc(c, c, c, 0, 6.2832); g.fill();
+  softCache.set(key, cv);
+  return cv;
+}
+const shadowSprite = () => softSprite('sh', [
+  [0, 'rgba(3,7,18,1)'], [.6, 'rgba(4,9,22,.42)'], [1, 'rgba(6,12,28,0)']
+]);
+const causticSprite = hue => {
+  const h = (hue / 12 | 0) * 12;
+  return softSprite('ca' + h, [
+    [0, `hsla(${h},95%,72%,1)`], [.45, `hsla(${h + 18},90%,60%,.34)`], [1, 'rgba(0,0,0,0)']
+  ]);
+};
+const bloomSprite = hue => {
+  const h = (hue / 12 | 0) * 12;
+  return softSprite('bl' + h, [
+    [0, `hsla(${h},95%,66%,1)`], [.55, `hsla(${h},95%,60%,.42)`], [1, 'rgba(0,0,0,0)']
+  ]);
+};
+/* ---------- marble ---------- */
+const HUES = [8, 32, 48, 96, 150, 186, 208, 232, 268, 300, 330];
+class Marble {
+  constructor(x, y, r, vx, vy) {
+    this.x = x; this.y = y;
+    this.r = r;
+    this.m = r * r * r;                     // mass ~ volume
+    this.vx = vx; this.vy = vy;
+    this.rot = rand(0, 6.28);
+    this.spin = rand(-.05, .05);
+    this.hue = HUES[(Math.random() * HUES.length) | 0] + rand(-9, 9);
+    this.spr = sprite(this.hue, r);
+    this.rest = 0;                           // frames spent nearly still on floor
+  }
+  step(dt) {
+    this.vy += cfg.gravity * dt;
+    this.vx *= cfg.friction; this.vy *= cfg.friction;
+    this.x += this.vx * dt; this.y += this.vy * dt;
+    this.rot += this.spin * dt;
+    this.spin *= .995;
+  }
+}
+let marbles = [];
+
+/* ---------- impact sparkles ---------- */
+const sparks = [];
+const SPARK_MAX = 420;
+function spark(x, y, hue, power) {
+  let n = clamp((power * .6) | 0, 1, 7);
+  n = Math.min(n, SPARK_MAX - sparks.length);
+  for (let i = 0; i < n; i++) {
+    sparks.push({
+      x, y, hue,
+      vx: rand(-1.7, 1.7), vy: rand(-2.6, -.3),
+      life: 1, decay: rand(.020, .045), sz: rand(.9, 2.4)
+    });
+  }
+}
+/* ---------- collisions: uniform-grid broadphase ---------- */
+// Contact speed below which a hit counts as resting rather than colliding.
+// It must stay above the velocity one frame of gravity adds, or a supported
+// marble re-qualifies as a collision every frame and the pile never settles.
+const restSlop = () => cfg.gravity * 2.4 + 0.25;
+const MU = 0.22;            // marble-on-marble tangential friction
+const grid = new Map();
+function solvePairs() {
+  grid.clear();
+  let cell = 0;
+  for (const m of marbles) if (m.r > cell) cell = m.r;
+  cell = cell * 2 + 1;
+
+  for (let i = 0; i < marbles.length; i++) {
+    const m = marbles[i];
+    const gx = Math.floor(m.x / cell), gy = Math.floor(m.y / cell);
+    const k = gx + ',' + gy;
+    let b = grid.get(k); if (!b) grid.set(k, b = []);
+    b.push(i);
+  }
+
+  const e = cfg.restitution, slop = restSlop();
+  for (const [k, bucket] of grid) {
+    const p = k.split(','), gx = +p[0], gy = +p[1];
+    for (let ox = 0; ox <= 1; ox++) {
+      for (let oy = (ox === 0 ? 0 : -1); oy <= 1; oy++) {
+        const other = (ox === 0 && oy === 0) ? bucket : grid.get((gx + ox) + ',' + (gy + oy));
+        if (!other) continue;
+        const same = other === bucket;
+        for (let ai = 0; ai < bucket.length; ai++) {
+          const A = marbles[bucket[ai]];
+          for (let bi = same ? ai + 1 : 0; bi < other.length; bi++) {
+            const B = marbles[other[bi]];
+            let dx = B.x - A.x, dy = B.y - A.y;
+            const rr = A.r + B.r;
+            let d2 = dx * dx + dy * dy;
+            if (d2 >= rr * rr || d2 === 0) continue;
+
+            let d = Math.sqrt(d2);
+            const nx = dx / d, ny = dy / d;
+            const overlap = rr - d;
+
+            // positional correction, weighted by mass
+            const tm = A.m + B.m, pa = B.m / tm, pb = A.m / tm;
+            A.x -= nx * overlap * pa; A.y -= ny * overlap * pa;
+            B.x += nx * overlap * pb; B.y += ny * overlap * pb;
+
+            // normal impulse
+            const rvx = B.vx - A.vx, rvy = B.vy - A.vy;
+            const vn = rvx * nx + rvy * ny;
+            if (vn > 0) continue;
+            // below the slop speed a contact is resting, not colliding: drop
+            // restitution so piles can actually come to rest
+            const eff = -vn < slop ? 0 : e;
+            const j = -(1 + eff) * vn / (1 / A.m + 1 / B.m);
+            A.vx -= j * nx / A.m; A.vy -= j * ny / A.m;
+            B.vx += j * nx / B.m; B.vy += j * ny / B.m;
+
+            // tangential rub → spin exchange, and a clink sparkle
+            const tx = -ny, ty = nx;
+            const vt = rvx * tx + rvy * ty;
+            A.spin += vt * .0016; B.spin -= vt * .0016;
+
+            // friction impulse: without it round marbles slide off each other
+            // forever and a heap never comes to rest
+            const jt = -vt * MU / (1 / A.m + 1 / B.m);
+            A.vx -= jt * tx / A.m; A.vy -= jt * ty / A.m;
+            B.vx += jt * tx / B.m; B.vy += jt * ty / B.m;
+
+            A.rest = B.rest = 0;
+            if (-vn > 2.2) {
+              const cx = A.x + nx * A.r, cy = A.y + ny * A.r;
+              spark(cx, cy, (A.hue + B.hue) / 2, -vn);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+function solveBounds() {
+  const fy = floorY(), e = cfg.restitution, slop = restSlop();
+  for (let i = marbles.length - 1; i >= 0; i--) {
+    const m = marbles[i];
+
+    if (m.x - m.r < 0) {
+      m.x = m.r;
+      if (m.vx < 0) {
+        if (-m.vx > 2.5) spark(0, m.y, m.hue, -m.vx);
+        m.vx = -m.vx * (-m.vx < slop ? 0 : e);
+      }
+      m.spin += m.vy * .004;
+    } else if (m.x + m.r > W) {
+      m.x = W - m.r;
+      if (m.vx > 0) {
+        if (m.vx > 2.5) spark(W, m.y, m.hue, m.vx);
+        m.vx = -m.vx * (m.vx < slop ? 0 : e);
+      }
+      m.spin -= m.vy * .004;
+    }
+
+    if (m.y + m.r > fy) {
+      m.y = fy - m.r;
+      if (m.vy > 0) {
+        if (m.vy > 2.4) spark(m.x, fy, m.hue, m.vy);
+        m.vy = m.vy < slop ? 0 : -m.vy * e;
+        m.spin += m.vx * .010;              // rolling kick on impact
+      }
+      m.vx *= cfg.ground;
+      // settle: once the bounce is spent, bleed off the remaining jitter
+      if (Math.abs(m.vy) < slop) { m.vy = 0; m.rest++; } else m.rest = 0;
+      if (m.rest > 10) { m.vx *= .82; m.spin *= .86; }
+      if (m.rest > 40) { m.vx = 0; m.spin *= .5; }
+    } else if (m.y - m.r > H + 400) {
+      marbles.splice(i, 1);
+    }
+  }
+}
+
+/* ---------- spawning ---------- */
+function drop(n, x, y, spread) {
+  for (let i = 0; i < n; i++) {
+    if (marbles.length >= cfg.maxCount) marbles.shift();
+    const r = cfg.radius * rand(.62, 1.28);
+    marbles.push(new Marble(
+      clamp((x ?? rand(W * .12, W * .88)) + rand(-spread, spread), r + 1, W - r - 1),
+      (y ?? rand(-260, -40)) + rand(-spread, spread),
+      r, rand(-1.6, 1.6), rand(0, 2.2)
+    ));
+  }
+}
+function shake() {
+  for (const m of marbles) {
+    m.vx += rand(-9, 9);
+    m.vy -= rand(3, 15);
+    m.spin += rand(-.16, .16);
+    m.rest = 0;
+  }
+}
+/* ---------- static backdrop (rebuilt on resize) ---------- */
+let backdrop = null;
+function buildBackdrop() {
+  if (!W || !H) return;
+  backdrop = makeCanvas(1);
+  backdrop.width = Math.round(W * DPR); backdrop.height = Math.round(H * DPR);
+  const g = backdrop.getContext('2d');
+  g.scale(DPR, DPR);
+  const fy = floorY();
+
+  // wall
+  let bg = g.createLinearGradient(0, 0, 0, fy);
+  bg.addColorStop(0, '#0c1222');
+  bg.addColorStop(.62, '#111a2e');
+  bg.addColorStop(1, '#18233c');
+  g.fillStyle = bg; g.fillRect(0, 0, W, fy);
+
+  // soft key light from upper-left
+  const key = g.createRadialGradient(W * .26, -H * .18, 0, W * .26, -H * .18, H * 1.15);
+  key.addColorStop(0, 'rgba(150,190,255,.20)');
+  key.addColorStop(.55, 'rgba(110,150,230,.05)');
+  key.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = key; g.fillRect(0, 0, W, fy);
+
+  // floor plate
+  let fl = g.createLinearGradient(0, fy, 0, H);
+  fl.addColorStop(0, '#1d2a46');
+  fl.addColorStop(.10, '#141d33');
+  fl.addColorStop(1, '#080d1a');
+  g.fillStyle = fl; g.fillRect(0, fy, W, H - fy);
+
+  // contact line
+  g.fillStyle = 'rgba(175,205,255,.22)'; g.fillRect(0, fy, W, 1);
+  g.fillStyle = 'rgba(120,160,225,.07)'; g.fillRect(0, fy + 1, W, 2);
+
+  // vignette
+  const vg = g.createRadialGradient(W / 2, H * .46, Math.min(W, H) * .30, W / 2, H * .46, Math.max(W, H) * .78);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,.55)');
+  g.fillStyle = vg; g.fillRect(0, 0, W, H);
+}
+/* ---------- render ---------- */
+function drawShadowsAndCaustics(fy) {
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, fy, W, H - fy); ctx.clip();
+
+  // contact shadows: tighter and darker the closer a marble sits to the floor
+  ctx.globalCompositeOperation = 'multiply';
+  const shs = shadowSprite();
+  for (const m of marbles) {
+    const h = clamp((fy - (m.y + m.r)) / 260, 0, 1);     // 0 = touching
+    const a = (1 - h) * .55;
+    if (a < .012) continue;
+    const rx = m.r * (1.06 + h * 1.5), ry = m.r * (.30 + h * .42);
+    ctx.globalAlpha = a;
+    ctx.drawImage(shs, m.x - rx, fy + m.r * .18 - ry, rx * 2, ry * 2);
+  }
+  ctx.globalAlpha = 1;
+
+  // caustics: light focused through the glass, offset along the light direction
+  ctx.globalCompositeOperation = 'lighter';
+  for (const m of marbles) {
+    const h = clamp((fy - (m.y + m.r)) / 200, 0, 1);
+    const a = (1 - h) * .40;
+    if (a < .012) continue;
+    const cx = m.x + m.r * .42, cy = fy + m.r * .22;
+    const rx = m.r * (.52 + h * .5), ry = rx * .34;
+    ctx.globalAlpha = a;
+    ctx.drawImage(causticSprite(m.hue), cx - rx, cy - ry, rx * 2, ry * 2);
+  }
+  ctx.globalAlpha = 1;
+
+  // mirrored marbles on the polished floor
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = .16;
+  for (const m of marbles) {
+    if (m.y + m.r < fy - 210) continue;
+    const sz = m.spr.css;
+    ctx.save();
+    ctx.translate(m.x, fy + (fy - m.y) * .40);
+    ctx.scale(1, -.40);
+    ctx.rotate(-m.rot);
+    ctx.drawImage(m.spr.body, -sz / 2, -sz / 2, sz, sz);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+function drawMarbles() {
+  for (const m of marbles) {
+    const sz = m.spr.css, half = sz / 2;
+
+    // outer bloom so glass feels lit rather than pasted on
+    ctx.globalCompositeOperation = 'lighter';
+    const br = m.r * 1.55;
+    ctx.globalAlpha = .20;
+    ctx.drawImage(bloomSprite(m.hue), m.x - br, m.y - br, br * 2, br * 2);
+    ctx.globalAlpha = 1;
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.save(); ctx.translate(m.x, m.y); ctx.rotate(m.rot);
+    ctx.drawImage(m.spr.body, -half, -half, sz, sz); ctx.restore();
+    ctx.drawImage(m.spr.shell, m.x - half, m.y - half, sz, sz);
+  }
+}
+
+function drawSparks() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = sparks.length - 1; i >= 0; i--) {
+    const p = sparks[i];
+    p.x += p.vx; p.y += p.vy; p.vy += .16; p.life -= p.decay;
+    if (p.life <= 0) { sparks.splice(i, 1); continue; }
+    ctx.fillStyle = `hsla(${p.hue},100%,${72 + p.life * 22}%,${p.life * .85})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.sz * p.life, 0, 6.2832); ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+/* ---------- main loop (fixed-step physics, capped catch-up) ---------- */
+let acc = 0, last = performance.now(), fpsT = last, frames = 0;
+const STEP = 1000 / 60;
+const fpsEl = document.getElementById('fps');
+
+function frame(now) {
+  let dtMs = now - last; last = now;
+  if (dtMs > 100) dtMs = 100;
+  acc += dtMs;
+
+  let steps = 0;
+  while (acc >= STEP && steps < 3) {
+    for (const m of marbles) m.step(1);
+    // relaxation passes: deeper piles and stronger gravity need more rounds
+    // to push overlapping neighbours apart
+    const iters = (marbles.length > 60 ? 8 : 5) + (cfg.gravity > 1.8 ? 12 : 0);
+    for (let it = 0; it < iters; it++) { solvePairs(); solveBounds(); }
+    acc -= STEP; steps++;
+  }
+  if (acc > STEP * 3) acc = 0;
+
+  if (rainOn && now - lastRain > 110) { drop(1, undefined, rand(-160, -60), 0); lastRain = now; }
+
+  const fy = floorY();
+  if (backdrop) ctx.drawImage(backdrop, 0, 0, W, H);
+  else { ctx.fillStyle = '#0c1222'; ctx.fillRect(0, 0, W, H); }
+  drawShadowsAndCaustics(fy);
+  drawMarbles();
+  drawSparks();
+
+  frames++;
+  if (now - fpsT > 500) {
+    fpsEl.textContent = Math.round(frames * 1000 / (now - fpsT)) + ' fps · ' + marbles.length + ' 珠';
+    frames = 0; fpsT = now;
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ---------- input ---------- */
+let rainOn = false, lastRain = 0;
+const $ = id => document.getElementById(id);
+
+$('drop').onclick = () => drop(16, undefined, undefined, 90);
+$('shake').onclick = shake;
+$('clear').onclick = () => { marbles.length = 0; sparks.length = 0; };
+$('rain').onclick = e => {
+  rainOn = !rainOn;
+  e.currentTarget.setAttribute('aria-pressed', rainOn);
+};
+
+function bindSlider(id, fmt, apply) {
+  const el = $(id), out = $(id + 'V');
+  el.oninput = () => { const v = +el.value; out.textContent = fmt(v); apply(v); };
+}
+bindSlider('rest', v => (v / 100).toFixed(2), v => cfg.restitution = v / 100);
+bindSlider('grav', v => (v / 100).toFixed(2), v => cfg.gravity = v / 100);
+bindSlider('size', v => v, v => cfg.radius = v);
+
+/* pointer: left = throw marbles, right = stir the pile */
+let dragging = 0, px = 0, py = 0, lastSpawn = 0;
+cvs.addEventListener('contextmenu', e => e.preventDefault());
+cvs.addEventListener('pointerdown', e => {
+  cvs.setPointerCapture(e.pointerId);
+  dragging = e.button === 2 ? 2 : 1;
+  px = e.clientX; py = e.clientY;
+  if (dragging === 1) { drop(3, px, py, 12); lastSpawn = performance.now(); }
+});
+cvs.addEventListener('pointermove', e => {
+  const dx = e.clientX - px, dy = e.clientY - py;
+  if (dragging === 1) {
+    const now = performance.now();
+    if (now - lastSpawn > 45) {
+      if (marbles.length >= cfg.maxCount) marbles.shift();
+      const r = cfg.radius * rand(.62, 1.28);
+      const m = new Marble(clamp(e.clientX, r + 1, W - r - 1), e.clientY, r, dx * .38, dy * .38);
+      marbles.push(m);
+      lastSpawn = now;
+    }
+  } else if (dragging === 2) {
+    for (const m of marbles) {
+      const ddx = m.x - e.clientX, ddy = m.y - e.clientY;
+      const d2 = ddx * ddx + ddy * ddy, R = 150;
+      if (d2 < R * R && d2 > 1) {
+        const f = (1 - Math.sqrt(d2) / R) * 1.5;
+        m.vx += dx * f; m.vy += dy * f;
+        m.spin += dx * f * .004;
+        m.rest = 0;
+      }
+    }
+  }
+  px = e.clientX; py = e.clientY;
+});
+const endDrag = () => dragging = 0;
+cvs.addEventListener('pointerup', endDrag);
+cvs.addEventListener('pointercancel', endDrag);
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { e.preventDefault(); drop(16, undefined, undefined, 90); }
+  else if (e.key === 'r' || e.key === 'R') { marbles.length = 0; sparks.length = 0; drop(26, undefined, undefined, 130); }
+});
+
+/* ---------- go ---------- */
+resize();
+drop(26, undefined, undefined, 140);
+requestAnimationFrame(frame);
+</script>
 </body>
 </html>
+
